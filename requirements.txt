@@ -1,0 +1,5 @@
+litellm
+duckduckgo-search
+pydantic
+python-dotenv
+google-generativeai
