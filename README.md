@@ -3,43 +3,33 @@
 ## Overview
 Project: Multiagent Orchestration Platform (Custom Telegram-capable / CLI Agent)
 Path: c:/Users/PC/prj/antigravity-telegram
-Framework: Custom event loop built on `litellm` (Direct API bridging) avoiding bloated abstractions, with local system access.
+Framework: LangChain & LangGraph with Python Telegram Bot
 Language: Python 3.x
 
 ## System Architecture
-The application runs a synchronous loop that proxies OpenAI-compatible tool calls mapped to native Python functions. The LLM handles logic and tool sequencing autonomously until completion. Configured via `config.yaml` but dynamically orchestrated in `agents/team.py`.
+The application runs as a LangGraph state machine. The primary interface is a Telegram bot that proxies user messages into the Graph. The graph consists of an LLM node (Gemini) that can choose to invoke tools, a Tool execution node, and a Summarizer node for memory management.
 
 ## Directory & File Structure
-- `main.py`: CLI entrypoint. Takes user request as trailing arguments. Initializes `create_team(user_request).kickoff()`.
-- `config.yaml`: Contains configuration. Noteworthy sections:
-  - `llm`: primary model (e.g., `gemini/gemini-2.5-flash`) and fallbacks (`gemini-2.5-pro` etc).
-  - `agents`: Defines PM, Engineer, Reviewer personas (mostly structural, currently the codebase relies heavily on the Engineer persona).
-- `requirements.txt`: Minimal dependencies: `litellm`, `duckduckgo-search`, `pydantic`, `python-dotenv`, `google-generativeai`.
-- `.env`: (Ignored in Git) Must contain API keys (e.g. `GEMINI_API_KEY`) for litellm to consume.
+- `main_telegram.py`: The main entrypoint. Starts an asynchronous Telegram bot polling loop. Uses `python-telegram-bot` and supports SOCKS5 proxy routing via `httpx[socks]`. User messages are passed into the `agent_graph`.
+- `requirements.txt`: Dependencies: `langchain`, `langgraph`, `langchain-google-genai`, `python-telegram-bot[socks]`, `httpx[socks]`, etc.
+- `.env`: (Ignored in Git) Must contain `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, and optionally `TELEGRAM_PROXY_URL`.
 
 ### Core Module (`/core/`)
-- `llm_router.py`: `LLMRouter` class reads `config.yaml` to parse `primary` and `fallbacks`. Exposes `chat_completion()` wrapping `litellm.completion` to manage model routing logic automatically.
-
-### Agent Loop (`/agents/`)
-- `team.py`: `NativeAgentTeam` and `create_team(user_request)`. 
-  - `NativeAgentTeam.__init__`: Defines `self.litellm_tools` array schemas (execute_shell_command, execute_python_code, web_search, read_file, write_file, list_directory) and `self.tools_map` pointing to actual Python tool functions.
-  - `NativeAgentTeam.run(user_request)`: Core iterative LLM tool-calling loop. Bootstraps with a System Prompt enforcing a "senior software engineer" persona with full VPS access. Parses tool calls from Litellm response, executes mapped python function directly, injecting the serialized result back as `{"role": "tool", "content": result_str}`. Returns final text when no more tools are requested.
+- `langchain_agent.py`: Defines the `AgentState` and constructs the LangGraph. 
+  - **Memory & Token Efficiency:** Uses a conditional summarization node triggered when the chat history exceeds `MAX_MESSAGES`. Summarizes previous conversations into a concise string to save context tokens. It also handles truncating massive tool outputs.
 
 ### Tool Implementations (`/tools/`)
 - `executor.py`: Sandbox bypass tools.
-  - `execute_shell_command(command: str)`: Runs via synchronous subprocess in `powershell`. Timeout 120s. Captures STDOUT/STDERR.
-  - `execute_python_code(code: str)`: Executes inline python payloads by writing to a temporary file, invoking `python`, capturing output, and auto-deleting the payload file. Timeout 120s.
-- `file_manager.py`: Host filesystem abstractions.
-  - `read_file(file_path: str)`: utf-8 read.
-  - `write_file(file_path: str, content: str)`: Creates path directories if missing, utf-8 overwrite.
-  - `list_directory(directory_path: str = ".")`: Returns `os.listdir` string serialization.
-- `web_search.py`: Knowledge acquisition.
-  - `web_search(query: str, max_results: int = 5)`: Uses DuckDuckGo (`DDGS().text`) to return search results formatted as Title, URL, and Snippet.
+  - `InteractiveShellTool`: A custom LangChain Tool. Executes shell commands across platforms (Powershell on Windows, bash on Linux). Implements output truncation to prevent token overflow.
+  - `execute_python_code(code: str)`: Executes inline python payloads dynamically.
+- `file_manager.py`: Host filesystem abstractions for reading, writing, and listing files.
+- `web_search.py`: `WebSearchTool` uses DuckDuckGo to return title, URL, and snippets.
 
-## Execution Flow for Agent Readers
-1. Execution starts at `main.py` -> `create_team()` -> `NativeAgentTeam.run()`.
-2. Initial messages array generated including `{"role": "system", ...}` and `{"role": "user", ...}`.
-3. Enters `while True:` tool-calling loop.
-4. `router.chat_completion` receives tools array.
-5. If `response_message.tool_calls` exist, iterate -> `json.loads(arguments)` -> dynamic invocation from `self.tools_map` -> append output to `messages`.
-6. Break loop and `return response_message.content` when LLM ceases tool requests.
+## Execution Flow inside LangGraph
+1. Execution starts via Telegram message in `main_telegram.py`, invoking `agent_graph.invoke()`.
+2. Graph routes to `summarizer` node: Checks if `len(messages)` > limit. If so, synthesizes a summary of older messages to preserve token space and clears them from state.
+3. Graph routes to `agent` node: Gemini processes the `SystemMessage` (containing instructions and current context summary) and user prompt.
+4. If Gemini returns tool calls (`tools_condition`), graph routes to `tools` node. `InteractiveShellTool` or `WebSearchTool` execute natively.
+5. Large outputs are defensively truncated inside the tools or summarizer before returning to the `agent` node.
+6. Loop continues until Gemini outputs a plain text response without a tool call.
+7. Graph finishes and returns the state to `main_telegram.py` which chunks and replies to the User over Telegram.
